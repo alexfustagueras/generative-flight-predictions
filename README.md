@@ -35,7 +35,3 @@ axes.
 - Extend the context with intent descriptors derived from the same 60 s history:
   - 12 continuous kinematic intent features
   - 25 one-hot intent classes (vertical x lateral phase)
-- Evaluate with paper-style plots and calibration diagnostics:
-  - MAE/RMSE vs horizon (model mean, best-of-S, CV baseline)
-  - PIT histograms and uniformity scores
-  - Over-dispersion index across horizon
