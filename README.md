@@ -23,3 +23,19 @@ Steps:
    - `dataset_cache/` with the `ecec4b007a021fa3.*` files (and associated `.npy/.parquet/.json`)
 3) Run the notebooks.
 
+## Intent-conditioned calibration experiment
+
+This fork adds a focused experiment to test whether explicit kinematic intent
+conditioning can improve probabilistic calibration (PIT), especially in lateral
+axes.
+
+### What changes
+
+- Keep the original CFM backbone unchanged.
+- Extend the context with intent descriptors derived from the same 60 s history:
+  - 12 continuous kinematic intent features
+  - 25 one-hot intent classes (vertical x lateral phase)
+- Evaluate with paper-style plots and calibration diagnostics:
+  - MAE/RMSE vs horizon (model mean, best-of-S, CV baseline)
+  - PIT histograms and uniformity scores
+  - Over-dispersion index across horizon
