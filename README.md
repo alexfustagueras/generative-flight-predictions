@@ -23,15 +23,47 @@ Steps:
    - `dataset_cache/` with the `ecec4b007a021fa3.*` files (and associated `.npy/.parquet/.json`)
 3) Run the notebooks.
 
-## Intent-conditioned calibration experiment
+Note: if you do not have the pre-built `dataset_cache/` files checked into your
+clone (these are large and often omitted from git), recreate the cache by
+running the dataset creation notebook `notebooks/01_dataset_creation.ipynb`,
+which contains the full data collection and preprocessing steps used to build
+the training/validation/test splits and normalization statistics.
 
-This fork adds a focused experiment to test whether explicit kinematic intent
-conditioning can improve probabilistic calibration (PIT), especially in lateral
-axes.
+## Calibration diagnostics
 
-### What changes
+This fork adds a small calibration tooling suite used to validate probabilistic
+coverage and reliability of CFM ensemble forecasts. Key script:
 
-- Keep the original CFM backbone unchanged.
-- Extend the context with intent descriptors derived from the same 60 s history:
-  - 12 continuous kinematic intent features
-  - 25 one-hot intent classes (vertical x lateral phase)
+- `diagnose_model.py`: lightweight per-checkpoint diagnostics useful for quick
+   local checks (defaults: `--n_subset=128`, `--n_samples=32`,
+   `--radii 50 100 200 400 800`). It produces per-radius reliability plots,
+   normalized cumulative calibration plots, and CSV summaries.
+
+Outputs (examples):
+
+- `calibration_summary.csv`, `calibration_regime_summary.csv`
+- `equal_width_bins_r{r}.csv`, `equal_count_bins_r{r}.csv`
+- `raw/raw_r{r}.csv` and `raw/raw_r{r}.npz` (contains `p_hat`, `y_true`, bin
+   ids and `flight_id` when available)
+- `plots/reliability_r{r}.png`, `plots/cumulative_r{r}.png`
+- `pit_summary.csv`, `coverage_summary.csv`, `score_summary.csv`
+
+Quick smoke-test command you can run locally (small, CPU/MPS-friendly):
+
+```bash
+# tiny smoke test (4 samples, 2 ensemble members)
+.venv/bin/python diagnose_model.py \
+   --ckpt models/cfm_base.pt --n_subset 4 --n_samples 2 \
+   --out-dir eval_smoke --batch-size 2 --n_steps 8 --nbins 5
+```
+
+For a full GPU-backed evaluation use a larger subset and sample count, for
+example via SLURM or the cluster scheduler.
+
+## Notes about training
+
+- The base CFM backbone was trained on the cached dataset and produces
+   probabilistic trajectories by sampling the learned conditional flow. Default
+   script configs point to `models/cfm_base.pt`.
+
+---

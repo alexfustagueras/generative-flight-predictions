@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Model diagnosis for frozen CFM trajectory checkpoints.
+"""Model diagnosis for CFM trajectory checkpoints.
 
 The script evaluates calibration, PIT, coverage, and score summaries on a
 cached test split and writes the raw tables and plots needed for inspection.
@@ -666,7 +666,7 @@ def evaluate(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache-dir", default=str(ROOT / "dataset_cache"))
-    ap.add_argument("--ckpt", default=str(ROOT / "models" / "cfm_base_epoch52.pt"))
+    ap.add_argument("--ckpt", default=str(ROOT / "models" / "cfm_base.pt"))
     ap.add_argument("--out-dir", default="")
     ap.add_argument("--n_subset", type=int, default=1000)
     ap.add_argument("--n_samples", type=int, default=32)
