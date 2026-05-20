@@ -28,7 +28,7 @@ FTPM2MPS = 0.3048 / 60.0
 _project_root = pathlib.Path(__file__).parent.parent  # utils/ parent directory
 CACHE_DIR = _project_root / "dataset_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_VERSION = "cfm-v4"
+CACHE_VERSION = "cfm-intent-v1"
 
 # ---------------------- Utilities ----------------------
 
@@ -181,6 +181,312 @@ def load_and_engineer(input_parquet: str) -> pd.DataFrame:
     return df
 
 
+def collect_parquet_files(data_dir, data_fraction: float = 0.20) -> list:
+    """
+    Collect parquet files from data directory, sampling data_fraction from each month.
+    """
+    data_dir = pathlib.Path(data_dir)
+    all_files = list(data_dir.glob("*.parquet"))
+    
+    if not all_files:
+        raise ValueError(f"No parquet files found in {data_dir}")
+    
+    if data_fraction >= 1.0:
+        return all_files
+    
+    files_by_month = {}
+    for f in all_files:
+        month_prefix = f.stem[:3].lower()
+        if month_prefix not in files_by_month:
+            files_by_month[month_prefix] = []
+        files_by_month[month_prefix].append(f)
+    
+    rng = np.random.default_rng(42)
+    selected_files = []
+    for month, files in sorted(files_by_month.items()):
+        n_files = max(1, int(len(files) * data_fraction))
+        selected = rng.choice(files, size=min(n_files, len(files)), replace=False)
+        selected_files.extend(selected)
+    
+    return [pathlib.Path(f) for f in selected_files]
+
+
+def load_data_from_files(parquet_files: list, sample_fraction: float | None = None) -> pd.DataFrame:
+    """
+    Load and combine data from multiple parquet files.
+    """
+    dfs = []
+    rng = np.random.default_rng(42)
+    
+    for i, parquet_file in enumerate(parquet_files):
+        try:
+            df = load_and_engineer(str(parquet_file))
+            month = parquet_file.stem[:3].lower()
+            df["month"] = month
+            
+            if sample_fraction is not None and sample_fraction < 1.0:
+                n_samples = max(1, int(len(df) * sample_fraction))
+                if n_samples < len(df):
+                    indices = rng.choice(len(df), size=n_samples, replace=False)
+                    df = df.iloc[indices].reset_index(drop=True)
+            dfs.append(df)
+        except Exception as e:
+            print(f"  Warning: Failed to load {parquet_file.name}: {e}")
+            continue
+    
+    if not dfs:
+        raise ValueError("No data files could be loaded")
+    
+    combined_df = pd.concat(dfs, ignore_index=True)
+    combined_df = combined_df.sort_values(
+        ["flight_id", "timestamp"], kind="mergesort"
+    ).reset_index(drop=True)
+    
+    return combined_df
+
+
+def filter_and_check(
+    df: pd.DataFrame,
+    min_fl: int = 195,
+    tol_sec: float = 0.0,
+    verbose: bool = True,
+    mode: str = "flight_min",
+) -> pd.DataFrame:
+    """Filter by FL and run fast data checks.
+
+    Modes:
+      - mode='flight_min' (default): retain only flights whose *minimum* FL is >= min_fl.
+        This is very strict and often drops most normal flights.
+      - mode='segments': drop rows with FL < min_fl and keep the remaining high-altitude
+        segments. Cadence checks then ensure windows don't cross gaps.
+
+    In both modes, this reports missing values and timestamp cadence issues.
+    """
+    if "z" not in df.columns:
+        raise ValueError("filter_and_check requires df to include column 'z'")
+    if "flight_id" not in df.columns or "timestamp" not in df.columns:
+        raise ValueError("filter_and_check requires df to include 'flight_id' and 'timestamp'")
+
+    df = df.copy()
+    df = df.sort_values(["flight_id", "timestamp"], kind="mergesort").reset_index(drop=True)
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+    df["flight_level"] = np.floor(df["z"] / 0.3048 / 100.0).astype("Int64")
+
+    total_flights = int(df["flight_id"].nunique())
+
+    mode = str(mode).strip().lower()
+    if mode not in {"flight_min", "segments"}:
+        raise ValueError("filter_and_check: mode must be 'flight_min' or 'segments'")
+
+    if mode == "flight_min":
+        flight_min_fl = df.groupby("flight_id", sort=False)["flight_level"].min()
+        valid_flights = flight_min_fl[flight_min_fl >= min_fl].index
+        df_filtered = df[df["flight_id"].isin(valid_flights)].reset_index(drop=True)
+        kept_flights = int(len(valid_flights))
+        dropped_flights = total_flights - kept_flights
+    else:
+        df_filtered = df[df["flight_level"] >= min_fl].reset_index(drop=True)
+        kept_flights = int(df_filtered["flight_id"].nunique())
+        dropped_flights = total_flights - kept_flights
+
+    total_rows = int(len(df))
+    filtered_rows = int(len(df_filtered))
+
+    check_columns = ["timestamp", "x", "y", "z", "vx", "vy", "vz"]
+    nan_mask = df_filtered[check_columns].isna()
+    nan_per_column = nan_mask.sum().to_dict()
+    n_nan_rows = int(nan_mask.any(axis=1).sum())
+    n_flights_with_nan = int(
+        nan_mask.any(axis=1).groupby(df_filtered["flight_id"], sort=False).any().sum()
+    )
+
+    dt = df_filtered.groupby("flight_id", sort=False)["timestamp"].diff().dt.total_seconds()
+    if tol_sec > 0.0:
+        bad_cadence = ~np.isclose(dt, 1.0, atol=tol_sec) & ~dt.isna()
+    else:
+        bad_cadence = (dt != 1.0) & ~dt.isna()
+    n_bad_cadence_rows = int(bad_cadence.sum())
+    n_bad_cadence_flights = int(
+        bad_cadence.groupby(df_filtered["flight_id"], sort=False).any().sum()
+    )
+
+    if verbose:
+        print("[filter_and_check] summary")
+        print(f"  mode: {mode}")
+        print(f"  total flights before FL filter: {total_flights}")
+        if mode == "flight_min":
+            print(f"  flights kept (min FL >= {min_fl}): {kept_flights}")
+        else:
+            print(f"  flights with any data kept (segments >= {min_fl}): {kept_flights}")
+        print(f"  flights dropped by FL: {dropped_flights}")
+        print(f"  total rows before FL filter: {total_rows}")
+        print(f"  total rows after FL filter: {filtered_rows}")
+
+        if n_nan_rows > 0:
+            print(f"  NaN rows in retained data: {n_nan_rows}")
+            print(f"  flights with NaN in retained data: {n_flights_with_nan}")
+            print(f"  NaN counts by column: {nan_per_column}")
+        else:
+            print("  NaN check: no missing values in checked columns")
+
+        if n_bad_cadence_rows > 0:
+            print(f"  1s cadence failures in retained data: {n_bad_cadence_rows} rows")
+            print(f"  flights with 1s spacing issues: {n_bad_cadence_flights}")
+        else:
+            print("  1s cadence check: all retained flights have exact 1s spacing")
+
+    return df_filtered
+
+
+def _drop_flights_with_nan(df: pd.DataFrame, cols: Tuple[str, ...]) -> pd.DataFrame:
+    bad_flights = df.loc[df[list(cols)].isna().any(axis=1), "flight_id"].unique()
+    if len(bad_flights) == 0:
+        return df
+    return df[~df["flight_id"].isin(bad_flights)].copy()
+
+
+def summarize_motion_distribution(
+    df: pd.DataFrame,
+    wparams: WindowParams,
+    turn: TurnSampling | None = None,
+    vertical: VerticalSampling | None = None,
+    tol_sec: float = 0.0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Summarize the distribution of level/climb/descent and turn windows.
+
+    This computes the distribution of valid windows from the current loaded DataFrame
+    without sampling, using the existing turn criteria and a vertical-motion criterion.
+    """
+    if turn is None:
+        turn = TurnSampling()
+    if vertical is None:
+        vertical = VerticalSampling()
+
+    features = ("x", "y", "z", "vx", "vy", "vz", "psi_rate")
+    all_starts, codes, flight_spans = _enumerate_windows(df, features, wparams)
+    T = wparams.input_len + wparams.output_horizon
+    mask = cadence_clean_window_mask(df, codes, all_starts, T, tol=tol_sec)
+    if all_starts.size == 0:
+        raise ValueError("No valid windows after enforcing 1 Hz cadence")
+    all_starts = all_starts[mask]
+
+    tri_true, tri_ps = _triad_flags(df, features, wparams, turn, codes, flight_spans)
+    if turn.consider_hist:
+        hist_turn = _any_triad(
+            tri_ps,
+            all_starts,
+            all_starts + wparams.input_len - turn.consec + 1,
+        )
+    else:
+        hist_turn = np.zeros_like(all_starts, dtype=bool)
+
+    fut_starts = all_starts + wparams.input_len
+    if turn.consider_future:
+        fut_turn = _any_triad(
+            tri_ps,
+            fut_starts,
+            fut_starts + wparams.output_horizon - turn.consec + 1,
+        )
+    else:
+        fut_turn = np.zeros_like(all_starts, dtype=bool)
+
+    turn_has = hist_turn | fut_turn
+
+    vz = df["vz"].to_numpy()
+    climb_bool = vz > float(vertical.vz_thr)
+    descend_bool = vz < -float(vertical.vz_thr)
+
+    n = len(vz)
+    climb_start = np.zeros(n, dtype=bool)
+    descend_start = np.zeros(n, dtype=bool)
+    for fcode, (start, length) in flight_spans.items():
+        end = start + length
+        climb_start[start:end] = _consecutive_true_start(
+            climb_bool[start:end], vertical.consec
+        )
+        descend_start[start:end] = _consecutive_true_start(
+            descend_bool[start:end], vertical.consec
+        )
+
+    climb_csum = np.cumsum(climb_start.astype(np.int64))
+    descend_csum = np.cumsum(descend_start.astype(np.int64))
+
+    counts = {
+        "level": 0,
+        "climb": 0,
+        "descent": 0,
+        "mixed": 0,
+    }
+    joint = {
+        "level": {"turn": 0, "no_turn": 0},
+        "climb": {"turn": 0, "no_turn": 0},
+        "descent": {"turn": 0, "no_turn": 0},
+        "mixed": {"turn": 0, "no_turn": 0},
+    }
+
+    for idx, abs_start in enumerate(all_starts):
+        hist_climb = _segment_has_event(
+            climb_csum,
+            abs_start,
+            abs_start + wparams.input_len - vertical.consec,
+        ) if vertical.consider_hist else False
+        fut_climb = _segment_has_event(
+            climb_csum,
+            abs_start + wparams.input_len,
+            abs_start + wparams.input_len + wparams.output_horizon - vertical.consec,
+        ) if vertical.consider_future else False
+        hist_descend = _segment_has_event(
+            descend_csum,
+            abs_start,
+            abs_start + wparams.input_len - vertical.consec,
+        ) if vertical.consider_hist else False
+        fut_descend = _segment_has_event(
+            descend_csum,
+            abs_start + wparams.input_len,
+            abs_start + wparams.input_len + wparams.output_horizon - vertical.consec,
+        ) if vertical.consider_future else False
+
+        climb_label = hist_climb or fut_climb
+        descend_label = hist_descend or fut_descend
+
+        if climb_label and not descend_label:
+            category = "climb"
+        elif descend_label and not climb_label:
+            category = "descent"
+        elif climb_label and descend_label:
+            category = "mixed"
+        else:
+            category = "level"
+
+        counts[category] += 1
+        joint[category]["turn" if turn_has[idx] else "no_turn"] += 1
+
+    summary = {
+        "total_windows": int(all_starts.shape[0]),
+        "turn_windows": int(turn_has.sum()),
+        "no_turn_windows": int((~turn_has).sum()),
+        "turn_fraction": float(turn_has.mean()),
+        "vertical_counts": counts,
+        "vertical_joint_turn": joint,
+    }
+
+    if verbose:
+        print("[summarize_motion_distribution]")
+        print(f"  total valid windows: {summary['total_windows']}")
+        print(f"  turn windows: {summary['turn_windows']} ({summary['turn_fraction']:.2%})")
+        print("  vertical window counts:")
+        for k, v in counts.items():
+            print(f"    {k}: {v}")
+        print("  joint counts (vertical x turn):")
+        for k, sub in joint.items():
+            print(f"    {k}: turn={sub['turn']}, no_turn={sub['no_turn']}")
+
+    return summary
+
+
 # ---------------------- Windowing & sampling ----------------------
 
 
@@ -213,6 +519,28 @@ class TurnSampling:
         return {
             "min_turn_frac": float(self.min_turn_frac),
             "turn_thr": float(self.turn_thr),
+            "consec": int(self.consec),
+            "consider_hist": bool(self.consider_hist),
+            "consider_future": bool(self.consider_future),
+        }
+
+
+@dataclass
+class VerticalSampling:
+    min_level_frac: float = 0.0
+    min_climb_frac: float = 0.0
+    min_descend_frac: float = 0.0
+    vz_thr: float = 0.5
+    consec: int = 3
+    consider_hist: bool = True
+    consider_future: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "min_level_frac": float(self.min_level_frac),
+            "min_climb_frac": float(self.min_climb_frac),
+            "min_descend_frac": float(self.min_descend_frac),
+            "vz_thr": float(self.vz_thr),
             "consec": int(self.consec),
             "consider_hist": bool(self.consider_hist),
             "consider_future": bool(self.consider_future),
@@ -308,6 +636,30 @@ def _any_triad(tri_ps: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
     b = np.clip(b, 0, len(tri_ps) - 1)
     a = np.clip(a, 0, len(tri_ps) - 1)
     return (tri_ps[b] - tri_ps[a]) > 0
+
+
+def _consecutive_true_start(mask: np.ndarray, consec: int) -> np.ndarray:
+    """Return start indices where at least `consec` consecutive True values begin."""
+    if consec <= 0:
+        raise ValueError("consec must be positive")
+
+    out = np.zeros(mask.shape, dtype=bool)
+    if len(mask) < consec:
+        return out
+
+    window = np.ones(consec, dtype=np.uint8)
+    true_runs = np.convolve(mask.astype(np.uint8), window, mode="valid")
+    out[: len(true_runs)][true_runs == consec] = True
+    return out
+
+
+def _segment_has_event(csum: np.ndarray, start: np.ndarray, end: np.ndarray) -> np.ndarray:
+    """Return True where the interval [start, end) contains any event markers."""
+    start = np.asarray(start, dtype=np.int64)
+    end = np.asarray(end, dtype=np.int64)
+    start = np.clip(start, 0, len(csum) - 1)
+    end = np.clip(end, 0, len(csum) - 1)
+    return (csum[end] - csum[start]) > 0
 
 
 def cadence_clean_window_mask(
@@ -461,6 +813,15 @@ def rotate_xy_inplace(arr: np.ndarray, c: np.ndarray, s: np.ndarray) -> None:
 def aircraft_centric_transform(
     X_raw: np.ndarray, Y_raw: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    X_raw = np.asarray(X_raw, dtype=np.float64)
+    Y_raw = np.asarray(Y_raw, dtype=np.float64)
+
+    if np.isnan(X_raw).any() or np.isnan(Y_raw).any():
+        raise ValueError(
+            "Missing values detected in X_raw/Y_raw during aircraft_centric_transform. "
+            "Ensure sample_windows filters NaN rows before transforming."
+        )
+
     refs = X_raw[:, -1, :3].copy()
     X_t = X_raw.copy()
     Y_t = Y_raw.copy()
@@ -513,11 +874,16 @@ def compute_or_load_norm_stats(
     turn: TurnSampling,
     stats_cfg: StatsConfig,
     fp: Dict[str, Any],
+    *,
+    min_fl: int | None = None,
+    min_fl_mode: str | None = None,
 ) -> Tuple[Dict[str, Any], str, pathlib.Path]:
     prep = {
         **wparams.to_prep_dict(),
         **{"transform": "aircraft_centric"},
         **stats_cfg.to_prep_dict(),
+        "min_fl": None if min_fl is None else int(min_fl),
+        "min_fl_mode": None if min_fl is None else str(min_fl_mode),
     }
     stats_key = make_stats_key(fp, prep)
     stats_path = (CACHE_DIR / stats_key).with_suffix(".norm_stats.json")
@@ -588,6 +954,27 @@ class SamplingConfig:
     test_turn: TurnSampling = field(
         default_factory=lambda: TurnSampling(min_turn_frac=0.0)
     )
+    train_vertical: VerticalSampling = field(
+        default_factory=lambda: VerticalSampling(
+            min_level_frac=0.0,
+            min_climb_frac=0.0,
+            min_descend_frac=0.0,
+        )
+    )
+    val_vertical: VerticalSampling = field(
+        default_factory=lambda: VerticalSampling(
+            min_level_frac=0.0,
+            min_climb_frac=0.0,
+            min_descend_frac=0.0,
+        )
+    )
+    test_vertical: VerticalSampling = field(
+        default_factory=lambda: VerticalSampling(
+            min_level_frac=0.0,
+            min_climb_frac=0.0,
+            min_descend_frac=0.0,
+        )
+    )
 
     def to_samp_dict(self) -> Dict[str, Any]:
         return {
@@ -597,6 +984,9 @@ class SamplingConfig:
             "train_turn": self.train_turn.to_dict(),
             "val_turn": self.val_turn.to_dict(),
             "test_turn": self.test_turn.to_dict(),
+            "train_vertical": self.train_vertical.to_dict(),
+            "val_vertical": self.val_vertical.to_dict(),
+            "test_vertical": self.test_vertical.to_dict(),
         }
 
 
@@ -652,8 +1042,25 @@ def build_or_load_dataset(
     scfg: SplitConfig,
     samp: SamplingConfig,
     stats_cfg: StatsConfig,
+    *,
+    min_fl: int | None = None,
+    min_fl_mode: str = "segments",
+    filter_verbose: bool = True,
 ):
     features = ("x", "y", "z", "vx", "vy", "vz", "psi_rate")
+
+    if min_fl is not None:
+        df = filter_and_check(
+            df,
+            min_fl=int(min_fl),
+            verbose=bool(filter_verbose),
+            mode=str(min_fl_mode),
+        )
+    else:
+        print(
+            "[build_or_load_dataset] WARNING: min_fl=None -> no altitude filtering applied. "
+            "Pass min_fl=195, min_fl_mode='segments' to enforce en-route-only windows."
+        )
 
     fp = df_fingerprint(df, features)
     prep = {
@@ -661,14 +1068,19 @@ def build_or_load_dataset(
         **scfg.to_prep_dict(),
         "transform": "aircraft_centric",
         "features": list(features),
+        "min_fl": None if min_fl is None else int(min_fl),
+        "min_fl_mode": None if min_fl is None else str(min_fl_mode),
     }
+    # Note: normalization stats should depend on feature engineering + windowing + filtering,
+    # but not on how we split flights into train/val/test.
     stats_key = make_stats_key(
         fp,
         {
             **wparams.to_prep_dict(),
-            **scfg.to_prep_dict(),
-            **stats_cfg.to_prep_dict(),
             "transform": "aircraft_centric",
+            "min_fl": None if min_fl is None else int(min_fl),
+            "min_fl_mode": None if min_fl is None else str(min_fl_mode),
+            **stats_cfg.to_prep_dict(),
         },
     )
     dset_key = make_dataset_key(fp, prep, samp.to_samp_dict())
@@ -717,9 +1129,25 @@ def build_or_load_dataset(
     df_val = df[df["flight_id"].astype(str).isin(val_flights)].copy()
     df_test = df[df["flight_id"].astype(str).isin(test_flights)].copy()
 
+    clean_cols = ("x", "y", "z", "vx", "vy", "vz")
+    df_train = _drop_flights_with_nan(df_train, clean_cols)
+    df_val = _drop_flights_with_nan(df_val, clean_cols)
+    df_test = _drop_flights_with_nan(df_test, clean_cols)
+
     norm_stats, stats_key_, stats_path = compute_or_load_norm_stats(
-        df_train, wparams, samp.train_turn, stats_cfg, fp
+        df_train,
+        wparams,
+        samp.train_turn,
+        stats_cfg,
+        fp,
+        min_fl=None if min_fl is None else int(min_fl),
+        min_fl_mode=None if min_fl is None else str(min_fl_mode),
     )
+    if stats_key_ != stats_key:
+        raise RuntimeError(
+            "Normalization stats key mismatch (bug): "
+            f"expected {stats_key}, got {stats_key_}"
+        )
 
     feat_mean = np.array(norm_stats["feat_mean"], dtype=np.float32)
     feat_std = np.array(norm_stats["feat_std"], dtype=np.float32)
@@ -786,6 +1214,8 @@ def build_or_load_dataset(
             "val": int(len(X_val)),
             "test": int(len(X_test)),
         },
+        "min_fl": None if min_fl is None else int(min_fl),
+        "min_fl_mode": None if min_fl is None else str(min_fl_mode),
         "turn_fractions": {
             "train": _turn_frac(meta_train),
             "val": _turn_frac(meta_val),

@@ -1,0 +1,24 @@
+{
+  "cache_dir": "dataset_cache",
+  "ckpt": "models/cfm_base.pt",
+  "out_dir": "test/calibration/big_cpu_7780",
+  "n_subset": 1000,
+  "n_samples": 64,
+  "n_steps": 64,
+  "batch_size": 32,
+  "radii": [
+    50.0,
+    100.0,
+    200.0,
+    400.0,
+    800.0
+  ],
+  "seed": 42,
+  "nbins": 10,
+  "min_regime_n": 500,
+  "score_pair_limit": 128,
+  "min_any_turn_samples": 500,
+  "dataset_key": "87991419c1be4279",
+  "norm_stats": "923864702464e7a6.norm_stats.json",
+  "device": "cpu"
+}

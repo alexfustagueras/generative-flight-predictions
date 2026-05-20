@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
-from utils.inference_utils import denorm_seq_to_global, sample_future_heun
+try:
+    from inference_utils import denorm_seq_to_global, sample_future_heun
+except Exception:
+    from utils.inference_utils import denorm_seq_to_global, sample_future_heun
 
 # ------------------------------
 # Utilities
@@ -485,3 +492,385 @@ def evaluate_model_distributional(
         spread_bt=spread_bt,
         horizons_sec=horizons_sec,
     )
+
+
+# ------------------------------
+# Formal protocol utilities
+# ------------------------------
+
+
+def _ks_distance_to_uniform(u: np.ndarray) -> float:
+    """Kolmogorov-Smirnov distance D_n from Uniform[0,1]."""
+    x = np.sort(np.asarray(u, dtype=np.float64).ravel())
+    n = x.size
+    if n == 0:
+        return float("nan")
+    i = np.arange(1, n + 1, dtype=np.float64)
+    d_plus = np.max(i / n - x)
+    d_minus = np.max(x - (i - 1) / n)
+    return float(max(d_plus, d_minus))
+
+
+def _ks_pvalue_asymptotic(d: float, n: int, terms: int = 200) -> float:
+    """Asymptotic p-value for one-sample KS test against continuous CDF."""
+    if n <= 0 or not np.isfinite(d):
+        return float("nan")
+    # Kolmogorov distribution tail approximation.
+    x = np.sqrt(float(n)) * float(d)
+    s = 0.0
+    for k in range(1, terms + 1):
+        s += (-1.0) ** (k - 1) * np.exp(-2.0 * (k**2) * (x**2))
+    p = max(0.0, min(1.0, 2.0 * s))
+    return float(p)
+
+
+def pit_uniformity_tests(
+    pits_btd: torch.Tensor | np.ndarray,
+    axis_names: Sequence[str] = ("x", "y", "z"),
+) -> Dict[str, Dict[str, float]]:
+    """
+    PIT uniformity diagnostics with KS distance and p-value.
+
+    Args:
+        pits_btd: (N,T,3) PIT values in [0,1]
+        axis_names: names for axes
+
+    Returns:
+        dict[axis] -> {mean, std, ks, pvalue, n}
+    """
+    pits = to_numpy(pits_btd)
+    if pits.ndim != 3:
+        raise ValueError("pits_btd must have shape (N,T,D)")
+    D = min(pits.shape[-1], len(axis_names))
+    out: Dict[str, Dict[str, float]] = {}
+    for d in range(D):
+        u = pits[..., d].ravel().astype(np.float64)
+        ks = _ks_distance_to_uniform(u)
+        n = int(u.size)
+        out[axis_names[d]] = {
+            "mean": float(np.mean(u)),
+            "std": float(np.std(u)),
+            "ks": float(ks),
+            "pvalue": _ks_pvalue_asymptotic(ks, n),
+            "n": float(n),
+        }
+    return out
+
+
+def pit_shape_summary(
+    pits_btd: torch.Tensor | np.ndarray,
+    axis_names: Sequence[str] = ("x", "y", "z"),
+) -> Dict[str, Dict[str, float | str]]:
+    """
+    Summarize PIT failure mode with interpretable moments.
+
+    The summary is intentionally descriptive rather than a hard test:
+    - mean < 0.5 suggests low bias, mean > 0.5 suggests high bias
+    - std < Uniform(std) suggests over-dispersion
+    - std > Uniform(std) suggests under-dispersion
+    - tail mass > center mass suggests U-shaped / under-dispersed PIT
+    """
+    pits = to_numpy(pits_btd)
+    if pits.ndim != 3:
+        raise ValueError("pits_btd must have shape (N,T,D)")
+    D = min(pits.shape[-1], len(axis_names))
+    uniform_std = 1.0 / math.sqrt(12.0)
+    out: Dict[str, Dict[str, float | str]] = {}
+
+    for d in range(D):
+        u = pits[..., d].ravel().astype(np.float64)
+        if u.size == 0:
+            out[axis_names[d]] = {
+                "mean": float("nan"),
+                "std": float("nan"),
+                "skew": float("nan"),
+                "tail_mass": float("nan"),
+                "center_mass": float("nan"),
+                "mode": "empty",
+            }
+            continue
+
+        mean = float(np.mean(u))
+        std = float(np.std(u))
+        centered = u - mean
+        m2 = float(np.mean(centered**2))
+        m3 = float(np.mean(centered**3))
+        skew = float(m3 / (m2 ** 1.5 + 1e-12))
+        tail_mass = float(np.mean((u < 0.1) | (u > 0.9)))
+        center_mass = float(np.mean((u >= 0.4) & (u <= 0.6)))
+
+        if tail_mass > center_mass + 0.05:
+            mode = "underdispersed"
+        elif center_mass > tail_mass + 0.05:
+            mode = "overdispersed"
+        elif mean < 0.47:
+            mode = "biased_low"
+        elif mean > 0.53:
+            mode = "biased_high"
+        else:
+            mode = "mixed"
+
+        out[axis_names[d]] = {
+            "mean": mean,
+            "std": std,
+            "std_gap": float(std - uniform_std),
+            "skew": skew,
+            "tail_mass": tail_mass,
+            "center_mass": center_mass,
+            "mode": mode,
+        }
+    return out
+
+
+def bootstrap_mean_ci(
+    x: torch.Tensor | np.ndarray,
+    n_boot: int = 1000,
+    alpha: float = 0.05,
+    seed: int = 1234,
+) -> Dict[str, float]:
+    """Bootstrap CI for the mean of a 1D sample."""
+    arr = np.asarray(to_numpy(x), dtype=np.float64).ravel()
+    n = arr.size
+    if n == 0:
+        return {"mean": float("nan"), "lo": float("nan"), "hi": float("nan")}
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(int(n_boot), n))
+    means = arr[idx].mean(axis=1)
+    lo = np.quantile(means, alpha / 2.0)
+    hi = np.quantile(means, 1.0 - alpha / 2.0)
+    return {"mean": float(arr.mean()), "lo": float(lo), "hi": float(hi)}
+
+
+def coverage_error_summary(
+    coverage: Dict[float, torch.Tensor | np.ndarray],
+) -> Dict[str, float]:
+    """
+    Summarize nominal-vs-empirical coverage errors.
+
+    Args:
+        coverage: dict[alpha] -> tensor of empirical coverages (any shape)
+    """
+    abs_errs = []
+    max_err = 0.0
+    for a, cov in coverage.items():
+        c = np.asarray(to_numpy(cov), dtype=np.float64)
+        e = np.abs(c - float(a))
+        abs_errs.append(e.ravel())
+        max_err = max(max_err, float(np.max(e)) if e.size else 0.0)
+    if len(abs_errs) == 0:
+        return {"mae": float("nan"), "max": float("nan")}
+    joined = np.concatenate(abs_errs) if abs_errs else np.array([], dtype=np.float64)
+    return {
+        "mae": float(np.mean(joined)) if joined.size else float("nan"),
+        "max": float(max_err),
+    }
+
+
+def _reliability_binned(
+    p_hat: np.ndarray,
+    y_obs: np.ndarray,
+    n_bins: int = 10,
+    strategy: str = "quantile",
+) -> Dict[str, Any]:
+    """Binned reliability summary and ECE for binary events."""
+    p = np.asarray(p_hat, dtype=np.float64).ravel()
+    y = np.asarray(y_obs, dtype=np.float64).ravel()
+    mask = np.isfinite(p) & np.isfinite(y)
+    p = p[mask]
+    y = y[mask]
+    n = p.size
+    if n == 0:
+        return {
+            "ece": float("nan"),
+            "bin_centers": np.array([], dtype=np.float64),
+            "pred_mean": np.array([], dtype=np.float64),
+            "obs_freq": np.array([], dtype=np.float64),
+            "counts": np.array([], dtype=np.float64),
+        }
+
+    if strategy == "quantile":
+        edges = np.quantile(p, np.linspace(0.0, 1.0, n_bins + 1))
+        edges[0], edges[-1] = 0.0, 1.0
+    else:
+        edges = np.linspace(0.0, 1.0, n_bins + 1)
+
+    # Ensure strictly increasing edges for digitize
+    edges = np.maximum.accumulate(edges)
+    for i in range(1, len(edges)):
+        if edges[i] <= edges[i - 1]:
+            edges[i] = min(1.0, edges[i - 1] + 1e-9)
+
+    bid = np.digitize(p, edges[1:-1], right=True)
+    pred_mean = np.full(n_bins, np.nan, dtype=np.float64)
+    obs_freq = np.full(n_bins, np.nan, dtype=np.float64)
+    counts = np.zeros(n_bins, dtype=np.float64)
+
+    for b in range(n_bins):
+        m = bid == b
+        nb = int(np.sum(m))
+        counts[b] = nb
+        if nb > 0:
+            pred_mean[b] = float(np.mean(p[m]))
+            obs_freq[b] = float(np.mean(y[m]))
+
+    valid = counts > 0
+    ece = (
+        float(np.sum((counts[valid] / max(1, n)) * np.abs(obs_freq[valid] - pred_mean[valid])))
+        if np.any(valid)
+        else float("nan")
+    )
+
+    return {
+        "ece": ece,
+        "bin_centers": 0.5 * (edges[:-1] + edges[1:]),
+        "pred_mean": pred_mean,
+        "obs_freq": obs_freq,
+        "counts": counts,
+    }
+
+
+@torch.no_grad()
+def event_reliability_from_samples(
+    y_samples: torch.Tensor,
+    y_true: torch.Tensor,
+    radii_m: Sequence[float] = (100.0, 300.0, 500.0),
+    n_bins: int = 10,
+    strategy: str = "quantile",
+) -> Dict[float, Dict[str, Any]]:
+    """
+    Reliability for event: "position lies within radius r of forecast center".
+
+    Forecast center is the ensemble mean at each (B,T).
+
+    Args:
+        y_samples: (S,B,T,3) sample forecasts in global frame
+        y_true:    (B,T,3) ground-truth positions in global frame
+    """
+    Y = y_samples[..., :3]
+    y = y_true[..., :3]
+    mu = Y.mean(dim=0)  # (B,T,3)
+
+    dist_s = torch.linalg.norm(Y - mu.unsqueeze(0), dim=-1)  # (S,B,T)
+    dist_t = torch.linalg.norm(y - mu, dim=-1)  # (B,T)
+
+    out: Dict[float, Dict[str, Any]] = {}
+    for r in radii_m:
+        p_hat = (dist_s <= float(r)).to(torch.float32).mean(dim=0)  # (B,T)
+        y_obs = (dist_t <= float(r)).to(torch.float32)  # (B,T)
+
+        global_rel = _reliability_binned(
+            to_numpy(p_hat), to_numpy(y_obs), n_bins=n_bins, strategy=strategy
+        )
+        per_h_ece = np.zeros(p_hat.shape[1], dtype=np.float64)
+        for t in range(p_hat.shape[1]):
+            r_t = _reliability_binned(
+                to_numpy(p_hat[:, t]), to_numpy(y_obs[:, t]), n_bins=n_bins, strategy=strategy
+            )
+            per_h_ece[t] = r_t["ece"]
+
+        out[float(r)] = {
+            "global": global_rel,
+            "ece_per_horizon": per_h_ece,
+            "p_hat": to_numpy(p_hat),
+            "y_obs": to_numpy(y_obs),
+        }
+    return out
+
+
+def calibration_protocol_verdict(
+    eval_out: Dict[str, Any],
+    *,
+    pit_alpha: float = 0.05,
+    ece_threshold: float = 0.03,
+    coverage_tol: float = 0.05,
+    mvn_coverage_tol: float = 0.08,
+    require_reliability: bool = False,
+) -> Dict[str, Any]:
+    """
+    Convert diagnostics into explicit pass/fail protocol checks.
+
+    Expected keys in eval_out:
+      pits_btd, coverage_1d, mvn_cov, es_whole_path (optional), reliability (optional)
+    """
+    pits = eval_out.get("pits_btd")
+    cov1d = eval_out.get("coverage_1d", {})
+    mvn_cov = eval_out.get("mvn_cov", {})
+    rel = eval_out.get("reliability", None)
+
+    pit_stats = pit_uniformity_tests(pits)
+    pit_pass = True
+    for _, v in pit_stats.items():
+        pval = v.get("pvalue", float("nan"))
+        if np.isfinite(pval) and pval <= pit_alpha:
+            pit_pass = False
+
+    cov1d_err = coverage_error_summary(cov1d)
+    mvn_err = coverage_error_summary(mvn_cov)
+    cov1d_pass = bool(np.isfinite(cov1d_err["max"]) and cov1d_err["max"] <= coverage_tol)
+    mvn_pass = bool(np.isfinite(mvn_err["max"]) and mvn_err["max"] <= mvn_coverage_tol)
+
+    reliability_pass = True
+    reliability_summary: Dict[str, float] = {}
+    if rel is not None:
+        eces = []
+        for _, rv in rel.items():
+            ece = rv.get("global", {}).get("ece", float("nan"))
+            if np.isfinite(ece):
+                eces.append(float(ece))
+        if len(eces) > 0:
+            ece_mean = float(np.mean(eces))
+            ece_max = float(np.max(eces))
+        else:
+            ece_mean, ece_max = float("nan"), float("nan")
+        reliability_summary = {"ece_mean": ece_mean, "ece_max": ece_max}
+        reliability_pass = bool(np.isfinite(ece_max) and ece_max <= ece_threshold)
+    elif require_reliability:
+        reliability_pass = False
+
+    overall = pit_pass and cov1d_pass and mvn_pass and (reliability_pass or not require_reliability)
+
+    es_ci = None
+    if "es_whole_path" in eval_out:
+        es_ci = bootstrap_mean_ci(eval_out["es_whole_path"])
+
+    checks = {
+        "pit_pass": pit_pass,
+        "coverage_1d_pass": cov1d_pass,
+        "mvn_coverage_pass": mvn_pass,
+        "reliability_pass": reliability_pass,
+    }
+
+    pit_shape = pit_shape_summary(pits)
+    dominant_modes = {axis: summary["mode"] for axis, summary in pit_shape.items()}
+
+    if pit_pass and (not cov1d_pass or not mvn_pass or not reliability_pass):
+        overall_mode = "partial"
+    elif pit_pass and cov1d_pass and mvn_pass and reliability_pass:
+        overall_mode = "pass"
+    else:
+        overall_mode = "reject"
+
+    failure_notes = []
+    for axis, summary in pit_shape.items():
+        if summary["mode"] != "mixed":
+            failure_notes.append(f"{axis}:{summary['mode']}")
+
+    return {
+        "overall_pass": bool(overall),
+        "overall_mode": overall_mode,
+        "checks": checks,
+        "thresholds": {
+            "pit_alpha": float(pit_alpha),
+            "ece_threshold": float(ece_threshold),
+            "coverage_tol": float(coverage_tol),
+            "mvn_coverage_tol": float(mvn_coverage_tol),
+        },
+        "pit": pit_stats,
+        "pit_shape": pit_shape,
+        "pit_failure_notes": failure_notes,
+        "dominant_pit_modes": dominant_modes,
+        "coverage_1d_error": cov1d_err,
+        "mvn_coverage_error": mvn_err,
+        "reliability": reliability_summary,
+        "es_whole_path_bootstrap": es_ci,
+    }

@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.DS_Store
 
 # Virtual environments
 .venv
@@ -19,9 +20,15 @@ dataset_cache/
 *.npz
 *.npy
 *.npz
+*.out
+*.err
 
 # Figures
+docs/
+models/
 figures/
+eval/
+test/
 *.svg
 
 # Webdata

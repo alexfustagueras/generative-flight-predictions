@@ -1,0 +1,8 @@
+{
+  "n_base_subset": 1000,
+  "n_eval_total": 1471,
+  "n_extra_any_turn": 471,
+  "n_any_turn_used": 500,
+  "n_no_turn_used": 971,
+  "min_any_turn_samples_target": 500
+}

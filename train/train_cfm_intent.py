@@ -3,8 +3,8 @@
 Train Intent-Conditioned CFM model
 
 This script trains an IntentFlowMatchingModel that extends the original CFM
-with 12 continuous + 25 one-hot intent features derived from the kinematic
-profile of the 60-second input history.
+with a compact 8-feature continuous intent block derived from the
+60-second input history, concatenated to the original 8-D context.
 
 Usage:
     python train_cfm_intent.py [--epochs 200] [--batch-size 2048] [--lr 3e-4]
@@ -36,7 +36,7 @@ SCRIPT_DIR = Path(__file__).parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-# Add parent (notebooks/) for access to generative-flight-predictions/utils
+# Add parents
 NOTEBOOKS_DIR = SCRIPT_DIR.parent
 if str(NOTEBOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(NOTEBOOKS_DIR))
@@ -45,11 +45,11 @@ GFP_DIR = NOTEBOOKS_DIR / "generative-flight-predictions"
 if str(GFP_DIR) not in sys.path:
     sys.path.insert(0, str(GFP_DIR))
 
-from model_intent import IntentFlowMatchingModel, sample_xt_and_target, get_model_config
-from intent import (
+from model_intent import (
+    IntentFlowMatchingModel,
+    sample_xt_and_target,
+    get_model_config,
     compute_intent_features_batch,
-    classify_intent_batch,
-    intent_index_to_onehot,
     denormalize_history,
 )
 
@@ -62,7 +62,7 @@ class IntentCFMDataset(Dataset):
     Each __getitem__ returns:
         x_hist:  (T_in, 7)   normalised history
         y_fut:   (T_out, 7)  normalised future
-        c_ext:   (45,)       extended context = [original_8, intent_12, onehot_25]
+        c_ext:   (18,)       extended context = [original_8, intent_10]
     """
 
     def __init__(
@@ -73,15 +73,13 @@ class IntentCFMDataset(Dataset):
         feat_mean: np.ndarray,
         feat_std: np.ndarray,
         intent_features: np.ndarray,
-        intent_labels: np.ndarray,
         intent_feat_mean: np.ndarray,
         intent_feat_std: np.ndarray,
     ):
         self.X = X
         self.Y = Y
         self.C = C
-        self.intent_features = intent_features  # (N, 12) pre-normalised
-        self.intent_labels = intent_labels      # (N,) int
+        self.intent_features = intent_features
         self.intent_feat_mean = intent_feat_mean
         self.intent_feat_std = intent_feat_std
 
@@ -95,15 +93,11 @@ class IntentCFMDataset(Dataset):
         # Original 8-D context
         c_orig = torch.tensor(self.C[i], dtype=torch.float32)
 
-        # 12-D normalised intent features
+        # 10-D normalised intent features
         intent_f = torch.tensor(self.intent_features[i], dtype=torch.float32)
 
-        # 25-D one-hot intent label
-        onehot = torch.zeros(25, dtype=torch.float32)
-        onehot[int(self.intent_labels[i])] = 1.0
-
-        # Concatenate: [8] + [12] + [25] = [45]
-        c_ext = torch.cat([c_orig, intent_f, onehot], dim=0)
+        # Concatenate: [8] + [10] = [18]
+        c_ext = torch.cat([c_orig, intent_f], dim=0)
 
         return x, y, c_ext
 
@@ -111,30 +105,28 @@ def precompute_intent(
     X_norm: np.ndarray,
     feat_mean: np.ndarray,
     feat_std: np.ndarray,
-    batch_size: int = 100_000) -> tuple[np.ndarray, np.ndarray]:
+    batch_size: int = 100_000) -> np.ndarray:
     """
     Precompute intent features and labels for the entire dataset.
     Works in batches to avoid memory issues with large datasets.
 
     Returns:
-        intent_features: (N, 12)
-        intent_labels: (N,) int32
+        intent_features: (N, 8)
     """
     N = X_norm.shape[0]
-    all_feats = np.empty((N, 12), dtype=np.float32)
-    all_labels = np.empty(N, dtype=np.int32)
+    all_feats = np.empty((N, 8), dtype=np.float32)
 
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
         X_batch = np.array(X_norm[start:end])
         X_phys = denormalize_history(X_batch, feat_mean, feat_std)
-        all_feats[start:end] = compute_intent_features_batch(X_phys)
-        all_labels[start:end] = classify_intent_batch(X_phys)
+        feats = compute_intent_features_batch(X_phys)
+        all_feats[start:end] = feats
 
         if (start // batch_size) % 5 == 0:
             print(f"  Intent precompute: {end}/{N} ({100*end/N:.1f}%)", flush=True)
 
-    return all_feats, all_labels
+    return all_feats
 
 # ── Training utilities ──────────────────────────────────────────────
 
@@ -195,6 +187,9 @@ class EMA:
 def train_intent_cfm(
     train_ds: IntentCFMDataset,
     val_ds: IntentCFMDataset,
+    feat_mean: np.ndarray,
+    feat_std: np.ndarray,
+    preprocess_meta: dict | None = None,
     epochs: int = 200,
     batch_size: int = 2048,
     lr: float = 3e-4,
@@ -204,8 +199,11 @@ def train_intent_cfm(
     ema_decay: float = 0.9995,
     patience: int = 50,
     model_cfg: dict | None = None,
-    ckpt_path: str = "best_cfm_intent.pt",
+    ckpt_path: str = "best_cfm_physics.pt",
     aux_w: float = 0.05,
+    kin_w: float = 0.0,
+    kin_dt: float = 5.0,
+    kin_mode: str = "v_t",
     accum_steps: int = 1,
     compile_mode: str = "none",
     device=None):
@@ -222,11 +220,11 @@ def train_intent_cfm(
         num_workers=num_workers, pin_memory=True, drop_last=True,
     )
 
-    cfg = model_cfg or get_model_config()
+    cfg = model_cfg or get_model_config(context_dim=8 + 8)
     model = IntentFlowMatchingModel(**cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
-    print(f"Context dimension: {cfg.get('context_dim', 45)}")
+    print(f"Context dimension: {cfg.get('context_dim', 0)}")
 
     # Resume from checkpoint if available
     resume = False
@@ -275,6 +273,7 @@ def train_intent_cfm(
         model.train() if train else model.eval()
         tot = n = 0
         pos_tot = vel_tot = aux_tot = 0.0
+        kin_tot = 0.0
 
         if train:
             opt.zero_grad(set_to_none=True)
@@ -300,7 +299,24 @@ def train_intent_cfm(
                 vel_loss = F.mse_loss(y_pred[..., 3:6], yb[..., 3:6])
                 aux_loss = F.mse_loss(y_pred[..., 6:7], yb[..., 6:7]) if aux_w > 0 else 0.0
 
-                loss = pos_w * pos_loss + vel_w * vel_loss + aux_w * aux_loss
+                kin_loss = 0.0
+                if kin_w and kin_w > 0:
+                    # Apply kinematic consistency on predicted FUTURE STATES in physical units.
+                    fm = torch.as_tensor(feat_mean, device=device, dtype=y_pred.dtype).view(1, 1, 7)
+                    fs = torch.as_tensor(feat_std, device=device, dtype=y_pred.dtype).view(1, 1, 7)
+                    y_phys = y_pred * fs + fm
+                    pos = y_phys[..., :3]
+                    vel = y_phys[..., 3:6]
+                    dpos = pos[:, 1:, :] - pos[:, :-1, :]
+                    if str(kin_mode).lower() == "v_tplus1":
+                        exp = vel[:, 1:, :] * float(kin_dt)
+                    elif str(kin_mode).lower() == "trapezoid":
+                        exp = 0.5 * (vel[:, :-1, :] + vel[:, 1:, :]) * float(kin_dt)
+                    else:  # "v_t"
+                        exp = vel[:, :-1, :] * float(kin_dt)
+                    kin_loss = F.mse_loss(dpos, exp)
+
+                loss = pos_w * pos_loss + vel_w * vel_loss + aux_w * aux_loss + kin_w * kin_loss
 
                 if train and accum_steps > 1:
                     loss = loss / accum_steps
@@ -321,12 +337,14 @@ def train_intent_cfm(
             pos_tot += float(pos_loss)
             vel_tot += float(vel_loss)
             aux_tot += float(aux_loss) if isinstance(aux_loss, torch.Tensor) else aux_loss
+            kin_tot += float(kin_loss) if isinstance(kin_loss, torch.Tensor) else kin_loss
 
         avg = tot / max(1, n)
         if log_components:
             print(
                 f"    Loss: total={avg:.6f} | pos={pos_tot/max(1,n):.6f} | "
-                f"vel={vel_tot/max(1,n):.6f} | aux*={aux_w * aux_tot/max(1,n):.6f}"
+                f"vel={vel_tot/max(1,n):.6f} | aux*={aux_w * aux_tot/max(1,n):.6f} | "
+                f"kin*={kin_w * kin_tot/max(1,n):.6f}"
             )
         return avg
 
@@ -369,7 +387,10 @@ def train_intent_cfm(
         if va < best_val - 1e-5:
             best_val, bad = va, 0
             ema.copy_to(model)
-            torch.save({"model_state": model.state_dict(), "model_cfg": cfg}, ckpt_path)
+            save_obj = {"model_state": model.state_dict(), "model_cfg": cfg}
+            if preprocess_meta is not None:
+                save_obj["preprocess"] = preprocess_meta
+            torch.save(save_obj, ckpt_path)
             print("  -> Saved best model")
         else:
             bad += 1
@@ -400,21 +421,21 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=2000)
     parser.add_argument("--ema-decay", type=float, default=0.9995)
     parser.add_argument("--patience", type=int, default=50)
-    parser.add_argument("--ckpt-path", type=str, default="models/cfm_intent_best.pt")
+    parser.add_argument("--ckpt-path", type=str, default="models/cfm_intent_physics_2.pt")
+    parser.add_argument("--kin-w", type=float, default=0.0)
+    parser.add_argument("--kin-dt", type=float, default=5.0)
+    parser.add_argument("--kin-mode", type=str, default="v_t")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="IntentCFM")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
-    parser.add_argument("--dataset-key", type=str, default="51397c8e8791f8ca",
-                        help="Dataset cache key (directory name under dataset_cache/)")
-    parser.add_argument("--accum-steps", type=int, default=1,
-                        help="Gradient accumulation steps (increase for smaller GPUs)")
+    parser.add_argument("--dataset-key", type=str, default="51397c8e8791f8ca")
+    parser.add_argument("--accum-steps", type=int, default=1)
     parser.add_argument(
         "--compile-mode",
         type=str,
         default="none",
-        help="torch.compile mode (e.g. reduce-overhead, max-autotune, or none)",
     )
     args = parser.parse_args()
 
@@ -470,10 +491,10 @@ def main():
 
     # ── Precompute intent features ──────────────────────────────────
     print("\nPrecomputing intent features for training set...")
-    train_intent_feats, train_intent_labels = precompute_intent(X_train, feat_mean, feat_std)
+    train_intent_feats = precompute_intent(X_train, feat_mean, feat_std)
 
     print("Precomputing intent features for validation set...")
-    val_intent_feats, val_intent_labels = precompute_intent(X_val, feat_mean, feat_std)
+    val_intent_feats = precompute_intent(X_val, feat_mean, feat_std)
 
     # Normalise intent features using training stats
     intent_mean = train_intent_feats.mean(axis=0)
@@ -481,24 +502,17 @@ def main():
     train_intent_feats_norm = ((train_intent_feats - intent_mean) / intent_std).astype(np.float32)
     val_intent_feats_norm = ((val_intent_feats - intent_mean) / intent_std).astype(np.float32)
 
-    # Print intent distribution
-    unique, counts = np.unique(train_intent_labels, return_counts=True)
-    print("\nIntent distribution (training):")
-    from intent import intent_name
-    for u, c in sorted(zip(unique, counts), key=lambda x: -x[1])[:10]:
-        print(f"  {intent_name(u):30s}: {c:>8d} ({100*c/len(train_intent_labels):.1f}%)")
-
     # ── Build datasets ──────────────────────────────────────────────
     train_ds = IntentCFMDataset(
         X_train, Y_train, C_train,
         feat_mean, feat_std,
-        train_intent_feats_norm, train_intent_labels,
+        train_intent_feats_norm,
         intent_mean, intent_std,
     )
     val_ds = IntentCFMDataset(
         X_val, Y_val, C_val,
         feat_mean, feat_std,
-        val_intent_feats_norm, val_intent_labels,
+        val_intent_feats_norm,
         intent_mean, intent_std,
     )
 
@@ -510,7 +524,7 @@ def main():
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ── W&B ─────────────────────────────────────────────────────────
-    model_cfg = get_model_config()
+    model_cfg = get_model_config(context_dim= 8 + 8)
     try:
         import wandb
         wandb_kwargs = {
@@ -529,8 +543,8 @@ def main():
                 "accum_steps": args.accum_steps,
                 "dataset_key": dset_key,
                 "model": "IntentFlowMatchingModel",
-                "intent_features": 12,
-                "intent_classes": 25,
+                "intent_features": 8,
+                "intent_onehot": 0,
             },
         }
         if args.wandb_name:
@@ -541,15 +555,15 @@ def main():
     except ImportError:
         print("[wandb] Not installed, skipping logging.")
 
-    # Save intent normalisation stats alongside checkpoint
-    intent_norm = {
+    preprocess_meta = {
+        "dataset_key": dset_key,
         "intent_feat_mean": intent_mean.tolist(),
         "intent_feat_std": intent_std.tolist(),
+        "feat_mean": feat_mean.tolist(),
+        "feat_std": feat_std.tolist(),
+        "ctx_mean": ctx_mean.tolist(),
+        "ctx_std": ctx_std.tolist(),
     }
-    import json
-    intent_norm_path = ckpt_path.with_suffix(".intent_norm.json")
-    intent_norm_path.write_text(json.dumps(intent_norm, indent=2))
-    print(f"Saved intent norm stats to {intent_norm_path}")
 
     # ── Train ───────────────────────────────────────────────────────
     print("\n" + "=" * 70)
@@ -558,12 +572,15 @@ def main():
     print(f"  Epochs:      {args.epochs}")
     print(f"  Batch size:  {args.batch_size}")
     print(f"  LR:          {args.lr}")
-    print(f"  Context dim: {model_cfg['context_dim']}  (8 orig + 12 intent + 25 one-hot)")
+    print(f"  Context dim: {model_cfg['context_dim']}  (8 orig + 6 intent)")
     print(f"  Checkpoint:  {ckpt_path}")
     print("=" * 70 + "\n")
 
     model = train_intent_cfm(
         train_ds, val_ds,
+        feat_mean=feat_mean,
+        feat_std=feat_std,
+        preprocess_meta=preprocess_meta,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
@@ -574,6 +591,9 @@ def main():
         patience=args.patience,
         model_cfg=model_cfg,
         ckpt_path=str(ckpt_path),
+        kin_w=args.kin_w,
+        kin_dt=args.kin_dt,
+        kin_mode=args.kin_mode,
         accum_steps=args.accum_steps,
         compile_mode=args.compile_mode,
         device=device,

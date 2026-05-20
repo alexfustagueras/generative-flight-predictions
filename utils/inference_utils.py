@@ -41,7 +41,16 @@ def sample_future_heun(
     amp_enabled = (
         (x_hist.device.type == "cuda") or (x_hist.device.type == "mps")
     ) and use_autocast
-    amp_dtype = torch.bfloat16
+    if x_hist.device.type == "cuda":
+        bf16_ok = False
+        if hasattr(torch.cuda, "is_bf16_supported"):
+            try:
+                bf16_ok = bool(torch.cuda.is_bf16_supported())
+            except Exception:
+                bf16_ok = False
+        amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+    else:
+        amp_dtype = torch.bfloat16
 
     # Perform Heun integration over n_steps to solve the flow ODE
     for k in range(n_steps):
