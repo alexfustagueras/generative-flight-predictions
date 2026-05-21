@@ -1,0 +1,25 @@
+{
+  "cache_dir": "dataset_cache",
+  "ckpt": "models/cfm_base.pt",
+  "out_dir": "test/diagnose/8030",
+  "n_subset": 1000,
+  "n_samples": 32,
+  "n_steps": 64,
+  "batch_size": 16,
+  "radii": [
+    50.0,
+    100.0,
+    200.0,
+    400.0,
+    800.0
+  ],
+  "seed": 42,
+  "nbins": 10,
+  "min_regime_n": 50,
+  "score_pair_limit": 128,
+  "alpha_values": [],
+  "dataset_key": "87991419c1be4279",
+  "norm_stats": "923864702464e7a6.norm_stats.json",
+  "dt_seconds": 5.0,
+  "device": "cpu"
+}
